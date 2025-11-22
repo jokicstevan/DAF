@@ -1,0 +1,1294 @@
+import pandas as pd
+import os
+from sqlalchemy import create_engine, inspect, text
+import pyodbc
+import pytz
+import warnings
+from sklearn.metrics import r2_score
+import pandas as pd
+import os
+import pickle
+from entsoe import EntsoePandasClient
+import numpy as np
+import openmeteo_requests
+from openmeteo_sdk.Variable import Variable
+from geopy.geocoders import Nominatim
+import requests_cache
+from retry_requests import retry
+from openpyxl import Workbook
+import math
+import datetime
+import requests
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import logging
+from collections import defaultdict
+import copy
+
+def interpolate_missing_datetimes_with_indices(datetime_array, freq, start, end):
+    """
+    Interpolates missing datetimes and returns insertion indices.
+    
+    Args:
+        datetime_array: np.ndarray[datetime64] with possible gaps
+        freq: str - frequency for interpolation ('H'=hourly, '30T'=30min, etc.)
+    
+    Returns:
+        tuple: (filled_datetimes, missing_indices)
+            - filled_datetimes: Complete datetime array
+            - missing_indices: Indices where values were interpolated
+    """
+    # Convert to pandas Series with dummy values
+    ts = pd.Series(np.zeros(len(datetime_array)), 
+                  index=pd.to_datetime(datetime_array))
+    
+    # Create complete datetime range
+    full_range = pd.date_range(start=start,
+                             end=end,
+                             freq=freq)
+    
+    # Find missing indices by comparing with complete range
+    missing_mask = ~full_range.isin(ts.index)
+    missing_indices = np.where(missing_mask)[0]
+    
+    # Reindex to create complete series
+    ts_complete = ts.reindex(full_range)
+    
+    # Print the number of rows interpolated
+    print("Successfully interpolated "+str(len(full_range)-len(datetime_array)) + " rows!")
+
+    return ts_complete.index.to_numpy(), missing_indices
+
+def check_sql_server_connection(server, driver, database='master'):
+    """Check if we can connect to SQL Server"""
+    try:
+        conn_str = f'DRIVER={driver};SERVER={server};DATABASE={database};Trusted_Connection=yes;'
+        conn = pyodbc.connect(conn_str)
+        print(f"✓ Successfully connected to SQL Server ({server})")
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Connection error: {e}")
+        return False
+
+def check_database_exists(server, database, driver):
+    """Check if database exists"""
+    try:
+        conn_str = f'DRIVER={driver};SERVER={server};DATABASE=master;Trusted_Connection=yes;'
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        cursor.execute(f"SELECT name FROM sys.databases WHERE name = '{database}'")
+        result = cursor.fetchone()
+        
+        conn.close()
+        exists = result is not None
+        if exists:
+            print(f"✓ Database '{database}' exists")
+        else:
+            print(f"✗ Database '{database}' does not exist")
+        return exists
+    except Exception as e:
+        print(f"Error checking database: {e}")
+        return False
+
+def clean_column_name(column_name):
+    """Clean column names for SQL compatibility"""
+    cleaned = ''.join(c if c.isalnum() or c == ' ' else '_' for c in str(column_name))
+    cleaned = cleaned.replace(' ', '_').lower()
+    if cleaned and not cleaned[0].isalpha():
+        cleaned = '_' + cleaned
+    return cleaned
+
+def verify_import_pyodbc(connection_string, table_name, original_df):
+    """Verify that data was imported correctly using pyodbc"""
+    try:
+        conn = pyodbc.connect(connection_string)
+        cursor = conn.cursor()
+        
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        imported_count = cursor.fetchone()[0]
+        
+        print(f"Verification: Original rows: {len(original_df)}, Imported rows: {imported_count}")
+        
+        if len(original_df) == imported_count:
+            print("✓ Import successful - row counts match")
+        else:
+            print("⚠ Warning - row counts don't match")
+            
+        # Show sample data
+        cursor.execute(f"SELECT TOP 3 * FROM {table_name}")
+        rows = cursor.fetchall()
+        print(f"\nFirst 3 rows from '{table_name}':")
+        for row in rows:
+            print(row)
+            
+        conn.close()
+            
+    except Exception as e:
+        print(f"Verification error: {e}")
+
+def encode_time_cyclic_flexible_decimal(df, mode='reduced'):
+    """
+    Encode time into cyclic components using decimal hour.
+    
+    Parameters:
+        df : pandas DataFrame
+            Must have a 'Time' column with datetime64[ns] dtype.
+        mode : str
+            One of 'reduced', 'day', or 'full'.
+    
+    Returns:
+        encoded_df : pandas DataFrame
+            DataFrame with cyclically encoded time features.
+    """
+    # Extract datetime column
+    time = pd.to_datetime(df)
+
+    # Date range to process
+    daterange = copy.copy(df)
+
+    # Decimal hour (e.g. 1.25, 13.5, ...)
+    hour_decimal = time.hour + time.minute / 60.0
+    hour_angle = 2 * np.pi * hour_decimal / 24.0
+    Hour_sin = np.sin(hour_angle)
+    Hour_cos = np.cos(hour_angle)
+
+    day_of_year = time.dayofyear
+    day_angle = 2 * np.pi * day_of_year / 365.0
+    month_angle = 2 * np.pi * time.month / 12.0
+
+    # Hours to handle the clock change
+    Hours = [time[i].hour for i in range(len(time))]
+        
+    # Indices to be deleted and appended
+    indices_to_delete = []
+    indices_to_insert = []
+
+    # First 
+    for h in range(4,len(Hours)):
+        if Hours[h] == Hours[h-4]:
+            indices_to_delete.extend([h])
+    
+    day_angle = [day_angle[i] for i in range(len(day_angle)) if i not in indices_to_delete]
+    month_angle = [month_angle[i] for i in range(len(month_angle)) if i not in indices_to_delete]
+    Hours = [Hours[i] for i in range(len(Hours)) if i not in indices_to_delete]
+    daterange = [daterange[i] for i in range(len(daterange)) if i not in indices_to_delete]
+    Hour_sin = [Hour_sin[i] for i in range(len(Hour_sin)) if i not in indices_to_delete]
+    Hour_cos = [Hour_cos[i] for i in range(len(Hour_cos)) if i not in indices_to_delete]
+
+    for h in range(len(Hours)):
+        if Hours[h] == Hours[h-4] + 2:
+            indices_to_insert.extend([h])
+
+    day_angle = insert_interpolated_values(day_angle, indices_to_insert,'num')
+    month_angle = insert_interpolated_values(month_angle, indices_to_insert,'num')
+    Hour_sin = insert_interpolated_values(Hour_sin, indices_to_insert,'num')
+    Hour_cos = insert_interpolated_values(Hour_cos, indices_to_insert,'num')
+    daterange = insert_interpolated_values(daterange, indices_to_insert,'date')
+
+    # Initialize result DataFrame
+    encoded_df = pd.DataFrame()
+
+    # Always include hour cycling features (both decimal and hour-in-day)
+    encoded_df['Hour_sin'] = Hour_sin
+    encoded_df['Hour_cos'] = Hour_cos
+
+    # Add day-of-year cyclic features if needed
+    if mode in ['day', 'full']:
+        encoded_df['Day_sin'] = np.sin(day_angle)
+        encoded_df['Day_cos'] = np.cos(day_angle)
+
+    # Add month cyclic features if needed
+    if mode == 'full':
+        encoded_df['Month_sin'] = np.sin(month_angle)
+        encoded_df['Month_cos'] = np.cos(month_angle)
+
+    # Return the final dates too, after interpolation ----
+     
+    return encoded_df, daterange
+
+def insert_interpolated_values(List, indices_to_insert, mode):
+    """
+    Insert interpolated values at specified integer indices in List list.
+    """
+    result = []
+    
+    if mode == 'date':
+        for i, value in enumerate(List):
+            # If this is an index where we need to insert, add interpolated value first
+            if i in indices_to_insert:
+                # Check if we have neighbors for interpolation
+                if i > 0 and i < len(List):
+                    interpolated_val = List[i]
+                    result.append(interpolated_val)
+        
+            # Always add the original value
+            result.append(value)
+    else:
+        for i, value in enumerate(List):
+            # If this is an index where we need to insert, add interpolated value first
+            if i in indices_to_insert:
+                # Check if we have neighbors for interpolation
+                if i > 0 and i < len(List):
+                    prev_val = List[i - 1]
+                    next_val = List[i]
+                    # Linear interpolation (average of neighbors)
+                    interpolated_val = (prev_val + next_val) / 2
+                    result.append(interpolated_val)
+        
+            # Always add the original value
+            result.append(value)
+    
+    return result
+
+def process_renewable_generation_data(Data, client, country, start, end):
+    '''
+    process renewable generation data - handle the data extracted from the entsoe
+    '''
+    # Generation data extraction from ENTSOE website
+    Generation_Data = client.query_generation(country, start=start - pd.Timedelta(days = 3), end=end)
+
+    # Define the largest lag
+    largestlag = 24*3*4
+
+    # Helper function for inserting interpolated values during clock changes
+    def insert_interpolated_values(values, insert_indices):
+        """Insert interpolated values at specified indices"""
+        result = values.copy()
+    
+        for idx in sorted(insert_indices, reverse=True):
+            if idx > 0 and idx < len(result):
+                # Linear interpolation between previous and next value
+                prev_val = result[idx-1] if idx > 0 else result[idx]
+                next_val = result[idx] if idx < len(result) else result[idx-1]
+            
+                if not np.isnan(prev_val) and not np.isnan(next_val):
+                    interpolated_val = (prev_val + next_val) / 2
+                    result.insert(idx, interpolated_val)
+                else:
+                    result.insert(idx, prev_val if not np.isnan(prev_val) else next_val)
+    
+        return result
+
+    def interpolation_missing_dates(Generation_Data):
+        # Determine the resolution of the input data
+        if len(Generation_Data) > 1:
+            time_diff = Generation_Data.index[1] - Generation_Data.index[0]
+            is_15min_resolution = time_diff <= pd.Timedelta(minutes=30)  # 15min or smaller
+        else:
+            is_15min_resolution = False  # Default assumption
+
+        # Create complete daterange that accounts for possible clock changes
+        Daterange = pd.date_range(start - pd.Timedelta(days=3), end, freq="15min", inclusive='left')
+
+        # Create series with the complete 15min daterange
+        GenerationRaw = pd.Series([np.nan] * len(Daterange), index=Daterange)
+
+        if not is_15min_resolution:
+            # HOURLY DATA: Interpolate and expand to 15min
+            print("Processing HOURLY data - interpolating to 15min resolution")
+        
+            # Filter to full hours only
+            DatesGeneration = Generation_Data.index
+            minuteindices = [j for j in range(len(DatesGeneration)) if pd.Timestamp(DatesGeneration[j]).minute == 0]
+            DatesGeneration = DatesGeneration[minuteindices]
+            Generation = np.array(Generation_Data[minuteindices])
+        
+            # Create hourly series for interpolation
+            hourly_daterange = pd.date_range(
+                start - pd.Timedelta(days=3), 
+                end, 
+                freq="H", 
+                inclusive='left'
+            )
+            hourly_series = pd.Series([np.nan] * len(hourly_daterange), index=hourly_daterange)
+        
+            # Fill available hourly data
+            for i, date in enumerate(DatesGeneration):
+                if date in hourly_series.index:
+                    hourly_series[date] = Generation[i]
+        
+            # Interpolate missing hourly values
+            hourly_series = hourly_series.interpolate(method='linear')
+        
+            # Expand hourly to 15min using linear interpolation between hours
+            for i in range(len(hourly_series) - 1):
+                current_hour = hourly_series.index[i]
+                next_hour = hourly_series.index[i + 1]
+                current_val = hourly_series.iloc[i]
+                next_val = hourly_series.iloc[i + 1]
+            
+                if not pd.isna(current_val) and not pd.isna(next_val):
+                    # Create 4 linear interpolated values for this hour
+                    for j in range(4):
+                        interp_time = current_hour + pd.Timedelta(minutes=15 * j)
+                        # Linear interpolation between current and next hour
+                        fraction = j / 4.0
+                        interp_value = current_val + (next_val - current_val) * fraction
+                    
+                        if interp_time in GenerationRaw.index:
+                            GenerationRaw[interp_time] = interp_value
+        
+            # Handle the last hour
+            if len(hourly_series) > 0:
+                last_hour = hourly_series.index[-1]
+                last_val = hourly_series.iloc[-1]
+                if not pd.isna(last_val):
+                    for j in range(4):
+                        interp_time = last_hour + pd.Timedelta(minutes=15 * j)
+                        if interp_time in GenerationRaw.index:
+                            GenerationRaw[interp_time] = last_val
+                        
+        else:
+            # 15MIN DATA: Direct interpolation
+            print("Processing 15MIN data - direct interpolation")
+        
+            DatesGeneration = Generation_Data.index
+            Generation = np.array(Generation_Data)
+        
+            # Fill available 15min data directly
+            for i, date in enumerate(DatesGeneration):
+                if date in GenerationRaw.index:
+                    GenerationRaw[date] = Generation[i]
+        
+            # Linear interpolation for missing 15min values
+            GenerationRaw = GenerationRaw.interpolate(method='linear')
+
+        # Handle clock changes (daylight saving time transitions)
+        Hours = [Daterange[i].hour for i in range(len(Daterange))]
+    
+        # Detect clock changes
+        indices_to_delete = []
+        indices_to_insert = []
+
+        for h in range(4, len(Hours)):
+            if Hours[h] == Hours[h-4]:
+                # Duplicate hour (fall back) - delete the duplicate
+                indices_to_delete.append(h)
+            elif Hours[h] == Hours[h-4] + 2:
+                # Skipped hour (spring forward) - insert interpolated values
+                indices_to_insert.append(h)
+
+        # Apply clock change adjustments
+        if indices_to_delete:
+            GenerationRaw_values = [GenerationRaw.iloc[i] for i in range(len(GenerationRaw)) if i not in indices_to_delete]
+        else:
+            GenerationRaw_values = GenerationRaw.tolist()
+
+        if indices_to_insert:
+            GenerationRaw_values = insert_interpolated_values(GenerationRaw_values, indices_to_insert)
+
+        return GenerationRaw_values
+
+    # Handle solar power plants
+    try:
+        Solar_Generation_Data = Generation_Data['Solar']['Actual Aggregated']
+        Solar_Generation_Raw = interpolation_missing_dates(Solar_Generation_Data)
+        
+        # Add features to Data
+        Data['Solar_Generation'] = Solar_Generation_Raw[largestlag:]
+        Data['Solar_Generation_Two_Days'] = Solar_Generation_Raw[largestlag-48*4:-48*4]
+        Data['Solar_Generation_Three_Days'] = Solar_Generation_Raw[largestlag-72*4:-72*4]
+    except:
+        print("There are no solar powerplants in " + country + "!")
+        pass
+
+    # Handle onshore wind power plants
+    try:
+        Wind_Onshore_Generation_Data = Generation_Data['Wind Onshore']['Actual Aggregated']
+        Wind_Onshore_Generation_Raw = interpolation_missing_dates(Wind_Onshore_Generation_Data)
+
+        # Add features to Data
+        Data['Wind_Onshore_Generation'] = Wind_Onshore_Generation_Raw[largestlag:]
+        Data['Wind_Onshore_Generation_Two_Days'] = Wind_Onshore_Generation_Raw[largestlag-48*4:-48*4]
+        Data['Wind_Onshore_Generation_Three_Days'] = Wind_Onshore_Generation_Raw[largestlag-72*4:-72*4]
+    except:
+        print("There are no offshore wind powerplants in " + country + "!")
+        pass
+
+    # Handle offshore wind power plants
+    try:
+        Wind_Offshore_Generation_Data = Generation_Data['Wind Offshore']['Actual Aggregated']
+        Wind_Offshore_Generation_Raw = interpolation_missing_dates(Wind_Offshore_Generation_Data)
+        Data['Wind_Offshore_Generation'] = Wind_Offshore_Generation_Raw[largestlag:]
+        Data['Wind_Offshore_Two_Days'] = Wind_Offshore_Generation_Raw[largestlag-48:-48]
+        Data['Wind_Offshore_Three_Days'] = Wind_Offshore_Generation_Raw[largestlag-72:-72]
+    except:
+        print("There are no offshore wind powerplants in " + country + "!")
+        pass
+
+    # Handle Run-of-the river power plants
+    try:
+        ROR_Generation_Data = Generation_Data['Hydro Run-of-river and poundage']['Actual Aggregated']
+        ROR_Generation_Raw = interpolation_missing_dates(ROR_Generation_Data)
+        Data['ROR'] = ROR_Generation_Raw[largestlag-48:-48]
+    except:
+        print("There are no ROR hydro powerplants in " + country + "!")
+        pass
+
+    return Data
+
+def setup_retry_session():
+    """Setup session with retry strategy"""
+    session = requests.Session()
+    
+    retry_strategy = Retry(
+        total=3,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        backoff_factor=1
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
+
+def fetch_data_with_chunks(url, params, max_chunk_months=6):
+    """Fetch data in chunks to avoid timeouts"""
+    start_date = pd.to_datetime(params["start_date"])
+    end_date = pd.to_datetime(params["end_date"])
+    
+    all_data = {"minutely_15": {}, "hourly": {}}
+    session = setup_retry_session()
+    
+    # Calculate chunk size
+    total_months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+    if total_months <= max_chunk_months:
+        # Small enough range, try direct request
+        try:
+            print(f"Fetching complete range: {params['start_date']} to {params['end_date']}")
+            response = session.get(url, params=params, timeout=120)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 504:
+                print("Direct request timed out, switching to chunked approach...")
+                # Continue with chunking
+            else:
+                raise e
+    
+    # Split into chunks
+    chunk_size = pd.DateOffset(months=max_chunk_months)
+    current_start = start_date
+    
+    while current_start < end_date:
+        current_end = min(current_start + chunk_size, end_date)
+        
+        print(f"Fetching chunk: {current_start.date()} to {current_end.date()}")
+        
+        chunk_params = params.copy()
+        chunk_params.update({
+            "start_date": current_start.strftime('%Y-%m-%d'),
+            "end_date": current_end.strftime('%Y-%m-%d')
+        })
+        
+        try:
+            response = session.get(url, params=chunk_params, timeout=120)
+            response.raise_for_status()
+            chunk_data = response.json()
+            
+            # Merge chunk data
+            for data_type in ['minutely_15', 'hourly']:
+                if data_type in chunk_data:
+                    for key, values in chunk_data[data_type].items():
+                        if key not in all_data[data_type]:
+                            all_data[data_type][key] = []
+                        all_data[data_type][key].extend(values)
+            
+            # Small delay between requests
+            time.sleep(1)
+            
+        except requests.exceptions.HTTPError as e:
+            print(f"Error fetching chunk {current_start.date()} to {current_end.date()}: {e}")
+            if max_chunk_months > 1:
+                # Retry with smaller chunks
+                return fetch_data_with_chunks(url, params, max_chunk_months // 2)
+            else:
+                raise e
+                
+        current_start = current_end + pd.Timedelta(days=1)
+    
+    return all_data
+
+def fallback_to_hourly_data(url, params, features_15min):
+    """Fallback to hourly data when 15min data fails"""
+    print("Falling back to hourly data resolution...")
+    
+    # Convert 15min features to hourly where possible
+    hourly_equivalents = {
+        'temperature_2m': 'temperature_2m',
+        'direct_radiation': 'direct_radiation', 
+        'diffuse_radiation': 'diffuse_radiation',
+        'global_tilted_irradiance': 'shortwave_radiation',
+        'snowfall': 'snowfall',
+        'rain': 'rain',
+        'wind_speed_80m': 'wind_speed_80m',
+        'relative_humidity_2m': 'relative_humidity_2m',
+        'wind_direction_80m': 'wind_direction_80m'
+    }
+    
+    hourly_features = []
+    for feature in features_15min:
+        if feature in hourly_equivalents:
+            hourly_features.append(hourly_equivalents[feature])
+    
+    fallback_params = params.copy()
+    fallback_params["hourly"] = hourly_features
+    if "minutely_15" in fallback_params:
+        del fallback_params["minutely_15"]
+    
+    try:
+        session = setup_retry_session()
+        response = session.get(url, params=fallback_params, timeout=120)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        print(f"Hourly fallback also failed: {e}")
+        raise e
+
+def open_meteo_solar_API(location, start, end, features_solar_15mins, url):
+    # Make sure all required weather variables are listed here
+    params = {
+        "latitude": float(location['lat']),
+        "longitude": float(location['lon']),
+        "start_date": start.strftime('%Y-%m-%d'),
+        "end_date": end.strftime('%Y-%m-%d'),
+        "timezone": "Europe/Belgrade",
+        "global_tilted_irradiance_tilt": 0,
+        "global_tilted_irradiance_azimuth": 0,
+        "minutely_15": features_solar_15mins
+    }
+
+    try:
+        # Try to fetch data with chunking
+        data = fetch_data_with_chunks(
+            url, 
+            params
+        )
+        minutes1 = data.get('minutely_15', {})
+        return minutes1
+    
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 504:
+            print("15min data request timed out, trying hourly fallback...")
+            # Fallback to hourly data
+            data = fallback_to_hourly_data(
+                url,
+                params, 
+                features_solar_15mins
+            )
+            hourly1 = data.get('hourly', {})
+                
+            # Convert hourly to pseudo-15min by repeating values
+            minutes1 = {}
+            for feature in features_solar_15mins:
+                if feature in hourly_equivalents and hourly_equivalents[feature] in hourly1:
+                    # Repeat each hourly value 4 times for 15min intervals
+                    minutes1[feature] = [val for val in hourly1[hourly_equivalents[feature]] for _ in range(4)]
+                else:
+                    minutes1[feature] = []
+        else:
+            # Re-raise other errors
+            raise e
+
+def open_meteo_wind_API(location, start, end, features_wind, features_wind_15mins, url):
+    # First get hourly data for wind speeds and pressure
+    hourly_params = {
+        "latitude": float(location['lat']),
+        "longitude": float(location['lon']),
+        "start_date": start.strftime('%Y-%m-%d'),
+        "end_date": end.strftime('%Y-%m-%d'),
+        "timezone": "Europe/Belgrade",
+        "hourly": features_wind,
+    }
+
+    try:
+        hourly_data = fetch_data_with_chunks(
+            url,
+            hourly_params
+        )
+        hourly1 = hourly_data.get('hourly', {})
+    
+    except requests.exceptions.HTTPError as e:
+        print(f"Failed to fetch hourly wind data: {e}")
+        hourly1 = {}
+
+    # Then get 15min data for other features
+    minutely_params = {
+        "latitude": float(location['lat']),
+        "longitude": float(location['lon']),
+        "start_date": start.strftime('%Y-%m-%d'),
+        "end_date": end.strftime('%Y-%m-%d'),
+        "timezone": "Europe/Belgrade",
+        "minutely_15": features_wind_15mins 
+    }
+
+    try:
+        minutely_data = fetch_data_with_chunks(
+            url, 
+            minutely_params
+        )
+        minutes1 = minutely_data.get('minutely_15', {})
+    
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 504:
+            print("15min wind data timed out, using hourly data...")
+            minutes1 = {}
+            # Create pseudo-15min data from hourly where possible
+            for feature in features_wind_15mins:
+                if feature in hourly1:
+                    minutes1[feature] = [val for val in hourly1[feature] for _ in range(4)]
+        else:
+            raise e
+
+    return hourly1, minutes1
+
+def merge_dictionaries(dict1, dict2):
+    merged = {}
+
+    # Process all keys from both dictionaries
+    all_keys = set(dict1.keys()) | set(dict2.keys())
+
+    for key in all_keys:
+        merged[key] = []
+        if key in dict1:
+            merged[key].extend(dict1[key])
+        if key in dict2:
+            merged[key].extend(dict2[key])
+
+    return merged
+
+def process_meteo_data(Data, weather_locations_solar, weather_locations_wind_onshore, weather_locations_wind_offshore, 
+                      start_historical, end_historical, start_periodical, 
+                      end_periodical, indicators_solar, indicators_wind_onshore, indicators_wind_offshore):
+    '''
+    process meteo data - handle the data extracted from the entsoe
+    '''
+
+    # Initiate a new Nominatim client for geopy
+    app = Nominatim(user_agent="tutorial")
+
+    # Read solar and wind locations for the chosen country
+    weather_locations_solar = pd.Series(weather_locations_solar).dropna().tolist()
+    weather_locations_wind = pd.Series(weather_locations_wind).dropna().tolist()
+    weather_locations_wind = pd.Series(weather_locations_wind).dropna().tolist()
+
+    print("Solar locations are: ")
+    print([weather_locations_solar[i] for i in range(len(weather_locations_solar))])
+    print("Wind Onshore locations are: ")
+    print([weather_locations_wind[i] for i in range(len(weather_locations_wind))])
+    print("Wind Offshore locations are: ")
+    print([weather_locations_wind[i] for i in range(len(weather_locations_wind))])
+
+    # 15 mins and hourly features
+    features_solar_15mins = ['temperature_2m','direct_radiation','diffuse_radiation','global_tilted_irradiance','snowfall','rain']
+    features_wind = ['wind_speed_80m','wind_speed_120m','surface_pressure']
+    features_wind_15mins = ['temperature_2m','wind_speed_80m','relative_humidity_2m','wind_direction_80m']
+
+    # Iterate through all of the locations
+    for j in range(len(weather_locations_solar)):
+        print(f"Processing solar location {j+1}/{len(weather_locations_solar)}: {weather_locations_solar[j]}")
+        
+        # Get location raw data - location + country
+        location = app.geocode(str(weather_locations_solar[j])).raw
+
+        # Specify the url for historical extraction
+        url_historical = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+        
+        # Extract historical
+        minutes1_historical = open_meteo_solar_API(location, start_historical-pd.Timedelta(3,"d"), end_historical-pd.Timedelta(1,"d"), features_solar_15mins, url_historical)
+
+        # Specify the url for historical extraction
+        url_periodical = "https://api.open-meteo.com/v1/forecast"
+
+        # Extract periodical
+        minutes1_periodical = open_meteo_solar_API(location, start_periodical, end_periodical, features_solar_15mins, url_periodical)
+
+        # Process the data
+        for k in range(len(features_solar_15mins)):
+            if indicators_solar.iloc[j, k+1] and features_solar_15mins[k] in minutes1_historical:
+                feature_data = minutes1_historical[features_solar_15mins[k]] + minutes1_periodical[features_solar_15mins[k]]
+                if len(feature_data) > 96*3:
+                    Data[weather_locations_solar[j] + '_' + features_solar_15mins[k]] = feature_data[96*3:]
+                    if len(feature_data) > 96*4:
+                        Data[weather_locations_solar[j] + '_' + features_solar_15mins[k] + '_lag_2'] = feature_data[96:-96*2]
+                    if len(feature_data) > 96*3:
+                        Data[weather_locations_solar[j] + '_' + features_solar_15mins[k] + '_lag_3'] = feature_data[-96*3]
+                else:
+                    print(f"Warning: Not enough data for {features_solar_15mins[k]}")
+
+    # For wind onshore forecast
+    for j in range(len(weather_locations_wind)):
+        print(f"Processing wind location {j+1}/{len(weather_locations_wind)}: {weather_locations_wind[j]}")
+        
+        # get location raw data - location + country
+        location = app.geocode(str(weather_locations_wind[j])).raw
+
+        # Specify the url for historical extraction
+        url_historical = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+
+        # Wind API
+        hourly1_historical, minutes1_historical = open_meteo_wind_API(location, start_historical, end_historical-pd.Timedelta(1,"d"), features_wind, features_wind_15mins, url_historical)
+
+        # Specify the url for historical extraction
+        url_periodical = "https://api.open-meteo.com/v1/forecast"
+
+        # Wind API
+        hourly1_periodical, minutes1_periodical = open_meteo_wind_API(location, start_periodical, end_periodical, features_wind, features_wind_15mins, url_periodical)
+
+        hourly = merge_dictionaries(hourly1_historical, hourly1_periodical)
+        minutes = merge_dictionaries(minutes1_historical, minutes1_periodical)
+
+        # Process wind data
+        if 'surface_pressure' in hourly:
+            Data[weather_locations_wind[j] + '_surface_pressure'] = [
+                item for item in hourly['surface_pressure'] for _ in range(4)
+            ]
+
+        if 'wind_speed_80m' in hourly and 'wind_speed_120m' in hourly:
+            repeated_ratio = [
+                hourly['wind_speed_120m'][i] / hourly['wind_speed_80m'][i] 
+                if hourly['wind_speed_80m'][i] > 0 else 1 
+                for i in range(len(hourly['wind_speed_120m']))
+            ]
+            repeated_ratio = [item for item in repeated_ratio for _ in range(4)]
+            
+            if 'wind_speed_80m' in minutes:
+                Data[weather_locations_wind[j] + '_wind_speed_120m'] = [
+                    repeated_ratio[i] * minutes['wind_speed_80m'][i] 
+                    for i in range(min(len(repeated_ratio), len(minutes['wind_speed_80m'])))
+                ]
+
+        for k in range(len(features_wind_15mins)):
+            if indicators_wind.iloc[j, k+1] and features_wind_15mins[k] in minutes:
+                Data[weather_locations_wind[j] + '_' + features_wind_15mins[k]] = minutes[features_wind_15mins[k]]
+
+        # For wind offshore forecast
+    for j in range(len(weather_locations_wind_offshore)):
+        print(f"Processing wind location {j+1}/{len(weather_locations_wind_offshore)}: {weather_locations_wind_offshore[j]}")
+        
+        # get location raw data - location + country
+        location = app.geocode(str(weather_locations_wind_offshore[j])).raw
+
+        # Specify the url for historical extraction
+        url_historical = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+
+        # Wind API
+        hourly1_historical, minutes1_historical = open_meteo_wind_API(location, start_historical, end_historical-pd.Timedelta(1,"d"), features_wind, features_wind_15mins, url_historical)
+
+        # Specify the url for historical extraction
+        url_periodical = "https://api.open-meteo.com/v1/forecast"
+
+        # Wind API
+        hourly1_periodical, minutes1_periodical = open_meteo_wind_API(location, start_periodical, end_periodical, features_wind, features_wind_15mins, url_periodical)
+
+        hourly = merge_dictionaries(hourly1_historical, hourly1_periodical)
+        minutes = merge_dictionaries(minutes1_historical, minutes1_periodical)
+
+        # Process wind data
+        if 'surface_pressure' in hourly:
+            Data[weather_locations_wind[j] + '_surface_pressure'] = [
+                item for item in hourly['surface_pressure'] for _ in range(4)
+            ]
+
+        if 'wind_speed_80m' in hourly and 'wind_speed_120m' in hourly:
+            repeated_ratio = [
+                hourly['wind_speed_120m'][i] / hourly['wind_speed_80m'][i] 
+                if hourly['wind_speed_80m'][i] > 0 else 1 
+                for i in range(len(hourly['wind_speed_120m']))
+            ]
+            repeated_ratio = [item for item in repeated_ratio for _ in range(4)]
+            
+            if 'wind_speed_80m' in minutes:
+                Data[weather_locations_wind[j] + '_wind_speed_120m'] = [
+                    repeated_ratio[i] * minutes['wind_speed_80m'][i] 
+                    for i in range(min(len(repeated_ratio), len(minutes['wind_speed_80m'])))
+                ]
+
+        for k in range(len(features_wind_15mins)):
+            if indicators_wind_offshore.iloc[j, k+1] and features_wind_15mins[k] in minutes:
+                Data[weather_locations_wind[j] + '_' + features_wind_15mins[k]] = minutes[features_wind_15mins[k]]
+        
+
+    return Data
+
+def process_entsoe_forecasted_renewables_data(Data, client, country, start, end):
+    '''
+    process solar forecast data - handle the data extracted from the entsoe
+    '''
+    # Query the wind and solar forecast
+    Generation_Data = client.query_wind_and_solar_forecast(country, start=start, end=end)
+    
+    def interpolation_missing_dates(Generation_Data):
+        # Determine the resolution of the input data
+        if len(Generation_Data) > 1:
+            time_diff = Generation_Data.index[1] - Generation_Data.index[0]
+            is_15min_resolution = time_diff <= pd.Timedelta(minutes=30)  # 15min or smaller
+        else:
+            is_15min_resolution = False  # Default assumption
+
+        # Create complete daterange that accounts for possible clock changes
+        Daterange = pd.date_range(start, end, freq="15min", inclusive='left')
+
+        # Create series with the complete 15min daterange
+        GenerationRaw = pd.Series([np.nan] * len(Daterange), index=Daterange)
+
+        if not is_15min_resolution:
+            # HOURLY DATA: Interpolate and expand to 15min
+            print("Processing HOURLY data - interpolating to 15min resolution")
+        
+            # Filter to full hours only
+            DatesGeneration = Generation_Data.index
+            minuteindices = [j for j in range(len(DatesGeneration)) if pd.Timestamp(DatesGeneration[j]).minute == 0]
+            DatesGeneration = DatesGeneration[minuteindices]
+            Generation = np.array(Generation_Data[minuteindices])
+        
+            # Create hourly series for interpolation
+            hourly_daterange = pd.date_range(
+                start, 
+                end, 
+                freq="H", 
+                inclusive='left'
+            )
+            hourly_series = pd.Series([np.nan] * len(hourly_daterange), index=hourly_daterange)
+        
+            # Fill available hourly data
+            for i, date in enumerate(DatesGeneration):
+                if date in hourly_series.index:
+                    hourly_series[date] = Generation[i]
+        
+            # Interpolate missing hourly values
+            hourly_series = hourly_series.interpolate(method='linear')
+        
+            # Expand hourly to 15min using linear interpolation between hours
+            for i in range(len(hourly_series) - 1):
+                current_hour = hourly_series.index[i]
+                next_hour = hourly_series.index[i + 1]
+                current_val = hourly_series.iloc[i]
+                next_val = hourly_series.iloc[i + 1]
+            
+                if not pd.isna(current_val) and not pd.isna(next_val):
+                    # Create 4 linear interpolated values for this hour
+                    for j in range(4):
+                        interp_time = current_hour + pd.Timedelta(minutes=15 * j)
+                        # Linear interpolation between current and next hour
+                        fraction = j / 4.0
+                        interp_value = current_val + (next_val - current_val) * fraction
+                    
+                        if interp_time in GenerationRaw.index:
+                            GenerationRaw[interp_time] = interp_value
+        
+            # Handle the last hour
+            if len(hourly_series) > 0:
+                last_hour = hourly_series.index[-1]
+                last_val = hourly_series.iloc[-1]
+                if not pd.isna(last_val):
+                    for j in range(4):
+                        interp_time = last_hour + pd.Timedelta(minutes=15 * j)
+                        if interp_time in GenerationRaw.index:
+                            GenerationRaw[interp_time] = last_val
+                        
+        else:
+            # 15MIN DATA: Direct interpolation
+            print("Processing 15MIN data - direct interpolation")
+        
+            DatesGeneration = Generation_Data.index
+            Generation = np.array(Generation_Data)
+        
+            # Fill available 15min data directly
+            for i, date in enumerate(DatesGeneration):
+                if date in GenerationRaw.index:
+                    GenerationRaw[date] = Generation[i]
+        
+            # Linear interpolation for missing 15min values
+            GenerationRaw = GenerationRaw.interpolate(method='linear')
+
+        # Handle clock changes (daylight saving time transitions)
+        Hours = [Daterange[i].hour for i in range(len(Daterange))]
+    
+        # Detect clock changes
+        indices_to_delete = []
+        indices_to_insert = []
+
+        for h in range(4, len(Hours)):
+            if Hours[h] == Hours[h-4]:
+                # Duplicate hour (fall back) - delete the duplicate
+                indices_to_delete.append(h)
+            elif Hours[h] == Hours[h-4] + 2:
+                # Skipped hour (spring forward) - insert interpolated values
+                indices_to_insert.append(h)
+
+        # Apply clock change adjustments
+        if indices_to_delete:
+            GenerationRaw_values = [GenerationRaw.iloc[i] for i in range(len(GenerationRaw)) if i not in indices_to_delete]
+        else:
+            GenerationRaw_values = GenerationRaw.tolist()
+
+        if indices_to_insert:
+            GenerationRaw_values = insert_interpolated_values(GenerationRaw_values, indices_to_insert)
+
+        return GenerationRaw_values
+
+    try:
+        # Extract solar data
+        SolarData = Generation_Data['Solar']
+        SolarRaw = interpolation_missing_dates(SolarData)
+
+        # Solar feature preparation
+        Data['Solar_Forecasted_ENTSOE'] = SolarRaw
+    except:
+        pass
+
+    try:
+        # Extract wind onshore data
+        WindOnshoreData = Generation_Data['Wind Onshore']
+        Wind_OnshoreRaw = interpolation_missing_dates(WindOnshoreData)
+
+        # Wind onshore feature preparation
+        Data['Wind_Onshore_Forecasted_ENTSOE'] = Wind_OnshoreRaw
+    except:
+        pass
+
+    try:
+        # Extract wind offshore data
+        WindOffshoreData = Generation_Data['Wind Offshore']
+        Wind_OffshoreRaw = interpolation_missing_dates(WindOffshoreData)
+
+        # Wind offshore feature preparation
+        Data['Wind_Offshore_Forecasted_ENTSOE'] = Wind_OffshoreRaw
+    except:
+        pass
+    
+    return Data
+
+def Data_Preparation(start, end, weather_locations_solar, weather_locations_wind_onshore, weather_locations_wind_offshore, indicators_solar, indicators_wind_onshore, indicators_wind_offshore, country, client):
+    '''
+    Prepare the data
+    '''
+
+    # Dataframe
+    Data = pd.DataFrame()
+
+    # Import the renewable data
+    Data = process_renewable_generation_data(Data, client, country, start, end + pd.Timedelta(2,"d"))
+
+    # Process meteo data - from start to end 
+    #Data = process_meteo_data(Data, weather_locations_solar, weather_locations_wind, start, end - pd.Timedelta(1,"d"), end - pd.Timedelta(1,"d"), end, indicators_solar, indicators_wind)
+    Data = process_meteo_data(Data, weather_locations_solar, weather_locations_wind_onshore, weather_locations_wind_offshore, start, end - pd.Timedelta(1,"d"), end - pd.Timedelta(1,"d"), end + pd.Timedelta(1,"d"), indicators_solar, indicators_wind_onshore, indicators_wind_offshore)
+
+    # Daterange - from start until the end + 2 days
+    daterange = pd.date_range(start=start, end=end + pd.Timedelta(2,"d"), freq='15min')
+
+    # Periodical features
+    encoded, daterange = encode_time_cyclic_flexible_decimal(daterange, mode='full')
+
+    # Store dates
+    Data['Dates'] = daterange[:-1]
+
+    # Remove the last sample
+    encoded = encoded.iloc[:-1]
+    Data['Hour_sin'] = encoded['Hour_sin'].values
+    Data['Hour_cos'] = encoded['Hour_cos'].values
+    Data['Day_sin'] = encoded['Day_sin'].values
+    Data['Day_cos'] = encoded['Day_cos'].values
+    Data['Month_sin'] = encoded['Month_sin'].values
+    Data['Month_cos'] = encoded['Month_cos'].values  
+
+    # Check what was the entsoe forecast
+    Data = process_entsoe_forecasted_renewables_data(Data, client, country, start, end + pd.Timedelta(2,"d"))
+
+    return Data
+
+def append_sql_rows(server, database, driver, table_name, new_data_df):
+    """
+    Append new rows from DataFrame to SQL Server table using pyodbc
+    Only imports columns that exist in the database table
+    
+    Parameters:
+    - server: SQL Server name
+    - database: Database name
+    - driver: ODBC driver
+    - table_name: Table to append to
+    - new_data_df: DataFrame containing new rows to append
+    """
+    
+    try:
+        # Create connection string
+        connection_string = f"DRIVER={driver};SERVER={server};DATABASE={database};Trusted_Connection=yes;"
+        
+        # Connect using pyodbc
+        conn = pyodbc.connect(connection_string)
+        cursor = conn.cursor()
+        
+        # STEP 1: Get column names from database table
+        cursor.execute(f"""
+        SELECT COLUMN_NAME 
+        FROM INFORMATION_SCHEMA.COLUMNS 
+        WHERE TABLE_NAME = '{table_name}' 
+        AND TABLE_SCHEMA = 'dbo'
+        ORDER BY ORDINAL_POSITION
+        """)
+        
+        db_columns = [row[0] for row in cursor.fetchall()]
+        print(f"DEBUG: Database columns in {table_name}: {db_columns}")
+        print(f"DEBUG: DataFrame columns: {list(new_data_df.columns)}")
+        
+        # STEP 2: Find common columns between DataFrame and database table
+        common_columns = [col for col in new_data_df.columns if col.lower() in db_columns]
+        missing_columns = [col for col in db_columns if col.lower() not in new_data_df.columns]
+        extra_columns = [col for col in new_data_df.columns if col.lower() not in db_columns]
+        
+        print(f"DEBUG: Common columns to import: {common_columns}")
+        if missing_columns:
+            print(f"DEBUG: Missing columns in DataFrame (will be NULL): {missing_columns}")
+        if extra_columns:
+            print(f"DEBUG: Extra columns in DataFrame (will be ignored): {extra_columns}")
+        
+        if not common_columns:
+            print("✗ No common columns found between DataFrame and database table")
+            conn.close()
+            return 0
+        
+        # STEP 3: Prepare the insert query with only common columns
+        placeholders = ', '.join(['?' for _ in common_columns])
+        column_names = ', '.join(common_columns)
+        
+        insert_query = f"""
+        INSERT INTO {database}.dbo.{table_name} ({column_names})
+        VALUES ({placeholders})
+        """
+        
+        print(f"DEBUG: Final insert query columns: {common_columns}")
+        
+        # STEP 4: Convert DataFrame rows to list of tuples (only common columns)
+        rows_to_insert = []
+        for index, row in new_data_df.iterrows():
+            row_values = []
+            for col in common_columns:
+                value = row[col]
+                # Convert pandas NaT/NaN to None for SQL NULL
+                if pd.isna(value):
+                    row_values.append(None)
+                else:
+                    row_values.append(value)
+            rows_to_insert.append(tuple(row_values))
+        
+        # STEP 5: Execute batch insert
+        cursor.executemany(insert_query, rows_to_insert)
+        rows_affected = cursor.rowcount
+        
+        # Commit transaction
+        conn.commit()
+        
+        print(f"✓ Successfully appended {rows_affected} row(s) to {table_name}")
+        print(f"✓ Imported columns: {common_columns}")
+        
+        conn.close()
+        return rows_affected
+        
+    except Exception as e:
+        print(f"✗ Error appending rows: {e}")
+        if 'conn' in locals():
+            conn.rollback()
+            conn.close()
+        return 0
+
+def df_to_sqlserver(country, weather_locations_solar, weather_locations_wind_onshore, weather_locations_wind_offshore, server, database, driver, table_name, if_exists, start_time, end_time, indicators_solar, indicators_wind_onshore, indicators_wind_offshore):
+    """
+    Import Excel file to SQL Server database using Windows Authentication
+    """
+    try:
+        # Step 1: Check SQL Server connection to master
+        if not check_sql_server_connection(server, driver, 'master'):
+            return False
+        
+        # Step 2: Check if database exists
+        if not check_database_exists(server, database, driver):
+            print(f"\nPlease create the database '{database}' manually:")
+            print("1. Open SQL Server Management Studio (SSMS)")
+            print("2. Connect using Windows Authentication")
+            print("3. Right-click on 'Databases' → 'New Database'")
+            print(f"4. Name it '{database}' → Click OK")
+            print("5. Press Enter to continue after creating the database...")
+            input("Press Enter when database is created...")
+            
+            # Verify database was created
+            if not check_database_exists(server, database, driver):
+                print("Database still not found. Please check your SQL Server installation.")
+                return False
+       
+        # Client connection
+        client = EntsoePandasClient(api_key="186656f9-a760-4910-8e8e-4f7051e19a5f")
+
+        # Define starting and ending time
+        start = pd.Timestamp(start_time, tz='Europe/Brussels')
+        end = pd.Timestamp(end_time, tz='Europe/Brussels')
+
+        # Create connection string to the specific database
+        connection_string = f"DRIVER={driver};SERVER={server};DATABASE={database};Trusted_Connection=yes;"
+        
+        # Use pyodbc directly instead of SQLAlchemy to avoid the parameter binding issue
+        print(f"Importing to table: {table_name}")
+        
+        # Connect using pyodbc
+        conn = pyodbc.connect(connection_string)
+        cursor = conn.cursor()
+        
+        # Drop table if exists and if_exists='replace'
+        if if_exists == 'replace':
+            try:
+                cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                conn.commit()
+                print(f"Dropped existing table: {table_name}")
+            except:
+                print(f"Table {table_name} doesn't exist or couldn't be dropped")
+        elif if_exists == "fill_in":
+            # First check if table exists before trying to extract last date
+            try:
+                cursor.execute(f"""
+                    SELECT CASE 
+                        WHEN OBJECT_ID('{table_name}', 'U') IS NOT NULL 
+                        THEN 1 ELSE 0 
+                    END as table_exists
+                """)
+                table_exists = cursor.fetchone()[0]
+    
+                if table_exists:
+                    cursor.execute(f"SELECT MAX(dates) FROM {table_name}")
+                    last_date = cursor.fetchone()[0]
+        
+                    # Convert to pandas Timestamp with CET timezone
+                    if last_date is not None:
+                        # If it's already a datetime object, convert to pandas Timestamp
+                        if isinstance(last_date, datetime.datetime):
+                            last_date = pd.Timestamp(last_date) + pd.Timedelta(1,"h")
+            
+                        # Localize to CET timezone
+                        cet_timezone = pytz.timezone('Europe/Brussels')
+                        start = last_date.tz_localize(cet_timezone) if last_date.tz is None else last_date.tz_convert(cet_timezone)
+            
+                        print(f"Last date in table {table_name}: {start}")
+                    else:
+                        print(f"Table {table_name} exists but contains no data")
+                        start = None
+                else:
+                    print(f"Table {table_name} does not exist")
+                    start = None
+        
+            except Exception as e:
+                print(f"Error checking table existence or extracting last date: {e}")
+                start = None
+
+        # Locations for weather import
+        weather_locations_solar = [weather_locations_solar[i] for i in range(len(weather_locations_solar)) if str(weather_locations_solar[i]) != "nan"]
+        weather_locations_wind_onshore = [weather_locations_wind_onshore[i] for i in range(len(weather_locations_wind_onshore)) if str(weather_locations_wind_onshore[i]) != "nan"]
+        weather_locations_wind_offshore = [weather_locations_wind_offshore[i] for i in range(len(weather_locations_wind_offshore)) if str(weather_locations_wind_offshore[i]) != "nan"]
+        
+        Data = Data_Preparation(start, end, weather_locations_solar, weather_locations_wind_onshore, weather_locations_wind_offshore, indicators_solar, indicators_wind_onshore, indicators_wind_offshore, country, client)
+
+        # Clean column names for SQL compatibility
+        Data.columns = [clean_column_name(col) for col in Data.columns]
+            
+        # Drop table if exists and if_exists='replace'
+        if if_exists == 'replace':
+            try:
+                # Drop table if exists
+                cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                conn.commit()
+                print(f"Dropped existing table: {table_name}")
+
+                # Create table with improved data type mapping
+                columns_def = []
+                for col_name, col_type in zip(Data.columns, Data.dtypes):
+                    sql_type = 'NVARCHAR(MAX)'  # Default type
+    
+                    if pd.api.types.is_integer_dtype(col_type):
+                        sql_type = 'BIGINT'  # Use BIGINT for larger range
+                    elif pd.api.types.is_float_dtype(col_type):
+                        sql_type = 'FLOAT'
+                    elif pd.api.types.is_datetime64_any_dtype(col_type):
+                        sql_type = 'DATETIME2'  # Use DATETIME2 for better precision
+                    elif pd.api.types.is_string_dtype(col_type):
+                        # Use VARCHAR with reasonable length for string columns
+                        sql_type = 'VARCHAR(255)'
+                    elif pd.api.types.is_bool_dtype(col_type):
+                        sql_type = 'BIT'
+            
+                    columns_def.append(f"[{col_name}] {sql_type}")
+        
+                create_table_sql = f"CREATE TABLE {table_name} ({', '.join(columns_def)})"
+                cursor.execute(create_table_sql)
+                print(f"Created table: {table_name}")
+
+                # Insert data using executemany for better performance
+                columns = ', '.join([f"[{col}]" for col in Data.columns])
+                placeholders = ', '.join(['?' for _ in range(len(Data.columns))])
+                insert_sql = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})"
+
+                try:
+                    # Convert DataFrame to list of tuples, handling NaN values
+                    data_tuples = []
+                    for _, row in Data.iterrows():
+                        # Convert pandas NaN to None (SQL NULL)
+                        row_values = [None if pd.isna(value) else value for value in row.values]
+                        data_tuples.append(tuple(row_values))
+    
+                    # Use executemany for bulk insert
+                    cursor.executemany(insert_sql, data_tuples)
+                    conn.commit()
+                    print(f"Successfully inserted {len(Data)} rows into {table_name}")
+    
+                except Exception as e:
+                    print(f"Error during data insertion: {e}")
+                    conn.rollback()
+                    raise  # Re-raise the exception to see the full error
+            except:
+                print(f"Table {table_name} doesn't exist or couldn't be dropped")
+        elif if_exists == "fill_in":
+            # First check if table exists before trying to extract last date
+            try:
+                cursor.execute(f"""
+                    SELECT CASE 
+                        WHEN OBJECT_ID('{table_name}', 'U') IS NOT NULL 
+                        THEN 1 ELSE 0 
+                    END as table_exists
+                """)
+                table_exists = cursor.fetchone()[0]
+    
+                if table_exists:
+                    # Insert data with explicit column names and proper parameter binding
+                    columns = ', '.join(Data.columns)
+                    placeholders = ', '.join(['?' for _ in range(len(Data.columns))])
+                    insert_sql = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})"
+
+                    for _, row in Data.iterrows():
+                        try:
+                            # Use tuple(row.values) instead of *row.values
+                            cursor.execute(insert_sql, tuple(row.values))
+                        except Exception as e:
+                            print(f"Error inserting row: {e}")
+                            # Continue with next row or break based on your needs
+                            continue
+
+                    # Commit the transaction
+                    conn.commit()
+                    print(f"Successfully appended {len(Data)} rows to {table_name}")
+                else:
+                    print(f"Table {table_name} does not exist")
+        
+            except Exception as e:
+                print(f"Error checking table existence or extracting last date: {e}")
+        
+        conn.commit()
+        conn.close()
+        
+        print(f"✓ Successfully imported {len(Data)} rows to {table_name}")
+        
+        # Verify import (using pyodbc)
+        verify_import_pyodbc(connection_string, table_name, Data)
+    except KeyError:
+        pass
