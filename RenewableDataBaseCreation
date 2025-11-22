@@ -771,8 +771,8 @@ def process_meteo_data(Data, weather_locations_solar, weather_locations_wind_ons
     for j in range(len(weather_locations_wind_offshore)):
         print(f"Processing wind location {j+1}/{len(weather_locations_wind_offshore)}: {weather_locations_wind_offshore[j]}")
         
-        # get location raw data - location + country
-        location = app.geocode(str(weather_locations_wind_offshore[j])).raw
+        # get location raw data - location + country - here location is in coordinates
+        location = str(weather_locations_wind_offshore[j])
 
         # Specify the url for historical extraction
         url_historical = "https://historical-forecast-api.open-meteo.com/v1/forecast"
