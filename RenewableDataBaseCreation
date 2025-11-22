@@ -674,15 +674,15 @@ def process_meteo_data(Data, weather_locations_solar, weather_locations_wind_ons
 
     # Read solar and wind locations for the chosen country
     weather_locations_solar = pd.Series(weather_locations_solar).dropna().tolist()
-    weather_locations_wind = pd.Series(weather_locations_wind).dropna().tolist()
-    weather_locations_wind = pd.Series(weather_locations_wind).dropna().tolist()
+    weather_locations_wind_onshore = pd.Series(weather_locations_wind_onshore).dropna().tolist()
+    weather_locations_wind_offshore = pd.Series(weather_locations_wind_offshore).dropna().tolist()
 
     print("Solar locations are: ")
     print([weather_locations_solar[i] for i in range(len(weather_locations_solar))])
     print("Wind Onshore locations are: ")
-    print([weather_locations_wind[i] for i in range(len(weather_locations_wind))])
+    print([weather_locations_wind_onshore[i] for i in range(len(weather_locations_wind_onshore))])
     print("Wind Offshore locations are: ")
-    print([weather_locations_wind[i] for i in range(len(weather_locations_wind))])
+    print([weather_locations_wind_offshore[i] for i in range(len(weather_locations_wind_offshore))])
 
     # 15 mins and hourly features
     features_solar_15mins = ['temperature_2m','direct_radiation','diffuse_radiation','global_tilted_irradiance','snowfall','rain']
@@ -722,11 +722,11 @@ def process_meteo_data(Data, weather_locations_solar, weather_locations_wind_ons
                     print(f"Warning: Not enough data for {features_solar_15mins[k]}")
 
     # For wind onshore forecast
-    for j in range(len(weather_locations_wind)):
-        print(f"Processing wind location {j+1}/{len(weather_locations_wind)}: {weather_locations_wind[j]}")
+    for j in range(len(weather_locations_wind_onshore)):
+        print(f"Processing wind location {j+1}/{len(weather_locations_wind_onshore)}: {weather_locations_wind_onshore[j]}")
         
         # get location raw data - location + country
-        location = app.geocode(str(weather_locations_wind[j])).raw
+        location = app.geocode(str(weather_locations_wind_onshore[j])).raw
 
         # Specify the url for historical extraction
         url_historical = "https://historical-forecast-api.open-meteo.com/v1/forecast"
@@ -764,7 +764,7 @@ def process_meteo_data(Data, weather_locations_solar, weather_locations_wind_ons
                 ]
 
         for k in range(len(features_wind_15mins)):
-            if indicators_wind.iloc[j, k+1] and features_wind_15mins[k] in minutes:
+            if indicators_wind_onshore.iloc[j, k+1] and features_wind_15mins[k] in minutes:
                 Data[weather_locations_wind[j] + '_' + features_wind_15mins[k]] = minutes[features_wind_15mins[k]]
 
         # For wind offshore forecast
