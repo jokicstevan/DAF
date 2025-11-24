@@ -1,0 +1,650 @@
+import pandas as pd
+import os
+from sqlalchemy import create_engine, inspect, text
+import pyodbc
+import warnings
+from sklearn.metrics import r2_score
+import pandas as pd
+import pickle
+from entsoe import EntsoePandasClient
+import numpy as np
+import openmeteo_requests
+import Server_Routines
+from openmeteo_sdk.Variable import Variable
+from geopy.geocoders import Nominatim
+import requests_cache
+from retry_requests import retry
+from openpyxl import Workbook
+import math
+import RenewablesDataBaseCreation
+import RenewablesDataBasePeriodicImport
+import RenewablesInitialBaseData
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import datetime
+import FFPrice
+import tensorflow as tf
+import tensorflow.keras.models
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import ConsumptionInitialBaseData
+import ConsumptionPeriodicImport
+import ConsumptionDataBaseCreation
+import tkinter as tk
+from tkinter import simpledialog, messagebox
+import copy 
+import ExtractGasandCoal
+
+warnings.filterwarnings('ignore')
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+def sqlserver_to_dataframe(server, database, driver, table_name):
+    """
+    Extract SQL Server table content to pandas DataFrame
+    
+    Parameters:
+        server: SQL Server name
+        database: Database name
+        driver: ODBC driver name
+        table_name: Table to extract
+    
+    Returns:
+        pandas DataFrame with the table content
+    """
+    try:
+        # Create connection string
+        connection_string = f"DRIVER={driver};SERVER={server};DATABASE={database};Trusted_Connection=yes;"
+        
+        # Connect using pyodbc
+        conn = pyodbc.connect(connection_string)
+        
+        # Read table into DataFrame
+        query = f"SELECT * FROM {table_name}"
+        df = pd.read_sql(query, conn)
+        
+        # Close connection
+        conn.close()
+        
+        print(f"✓ Successfully extracted {len(df)} rows from {table_name}")
+        print(f"Table shape: {df.shape}")
+        print(f"Columns: {list(df.columns)}")
+        
+        return df
+        
+    except Exception as e:
+        print(f"Error extracting data: {e}")
+        return None
+    
+def set_path(path):
+    # Set the path
+    os.chdir(path)
+
+def verify_import_pyodbc(connection_string, table_name, original_df):
+    """Verify that data was imported correctly using pyodbc"""
+    try:
+        conn = pyodbc.connect(connection_string)
+        cursor = conn.cursor()
+        
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        imported_count = cursor.fetchone()[0]
+        
+        print(f"Verification: Original rows: {len(original_df)}, Imported rows: {imported_count}")
+        
+        if len(original_df) == imported_count:
+            print("✓ Import successful - row counts match")
+        else:
+            print("⚠ Warning - row counts don't match")
+            
+        # Show sample data
+        cursor.execute(f"SELECT TOP 3 * FROM {table_name}")
+        rows = cursor.fetchall()
+        print(f"\nFirst 3 rows from '{table_name}':")
+        for row in rows:
+            print(row)
+            
+        conn.close()
+            
+    except Exception as e:
+        print(f"Verification error: {e}")
+
+# Drop table if exists and if_exists='replace'
+def import_to_table(if_exists, table_name, database, Data):
+
+    # Create connection string to the specific database
+    connection_string = f"DRIVER={driver};SERVER={server};DATABASE={database};Trusted_Connection=yes;"
+        
+    # Use pyodbc directly instead of SQLAlchemy to avoid the parameter binding issue
+    print(f"Importing to table: {table_name}")
+        
+    # Connect using pyodbc
+    conn = pyodbc.connect(connection_string)
+    cursor = conn.cursor()
+
+    if if_exists == 'replace':
+        try:
+            # Drop table if exists
+            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+            conn.commit()
+            print(f"Dropped existing table: {table_name}")
+
+            # Create table with improved data type mapping
+            columns_def = []
+            for col_name, col_type in zip(Data.columns, Data.dtypes):
+                sql_type = 'NVARCHAR(MAX)'  # Default type
+    
+                if pd.api.types.is_integer_dtype(col_type):
+                    sql_type = 'BIGINT'  # Use BIGINT for larger range
+                elif pd.api.types.is_float_dtype(col_type):
+                    sql_type = 'FLOAT'
+                elif pd.api.types.is_datetime64_any_dtype(col_type):
+                    sql_type = 'DATETIME2'  # Use DATETIME2 for better precision
+                elif pd.api.types.is_string_dtype(col_type):
+                    # Use VARCHAR with reasonable length for string columns
+                    sql_type = 'VARCHAR(255)'
+                elif pd.api.types.is_bool_dtype(col_type):
+                    sql_type = 'BIT'
+            
+                columns_def.append(f"[{col_name}] {sql_type}")
+        
+            create_table_sql = f"CREATE TABLE {table_name} ({', '.join(columns_def)})"
+            cursor.execute(create_table_sql)
+            print(f"Created table: {table_name}")
+
+            # Insert data using executemany for better performance
+            columns = ', '.join([f"[{col}]" for col in Data.columns])
+            placeholders = ', '.join(['?' for _ in range(len(Data.columns))])
+            insert_sql = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})"
+
+            try:
+                # Convert DataFrame to list of tuples, handling NaN values
+                data_tuples = []
+                for _, row in Data.iterrows():
+                    # Convert pandas NaN to None (SQL NULL)
+                    row_values = [None if pd.isna(value) else value for value in row.values]
+                    data_tuples.append(tuple(row_values))
+    
+                # Use executemany for bulk insert
+                cursor.executemany(insert_sql, data_tuples)
+                conn.commit()
+                print(f"Successfully inserted {len(Data)} rows into {table_name}")
+    
+            except Exception as e:
+                print(f"Error during data insertion: {e}")
+                conn.rollback()
+                raise  # Re-raise the exception to see the full error
+        except:
+            print(f"Table {table_name} doesn't exist or couldn't be dropped")
+    elif if_exists == "fill_in":
+        # First check if table exists before trying to extract last date
+        try:
+            cursor.execute(f"""
+                SELECT CASE 
+                    WHEN OBJECT_ID('{table_name}', 'U') IS NOT NULL 
+                    THEN 1 ELSE 0 
+                END as table_exists
+            """)
+            table_exists = cursor.fetchone()[0]
+    
+            if table_exists:
+                # Insert data with explicit column names and proper parameter binding
+                columns = ', '.join(Data.columns)
+                placeholders = ', '.join(['?' for _ in range(len(Data.columns))])
+                insert_sql = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})"
+
+                for _, row in Data.iterrows():
+                    try:
+                        # Use tuple(row.values) instead of *row.values
+                        cursor.execute(insert_sql, tuple(row.values))
+                    except Exception as e:
+                        print(f"Error inserting row: {e}")
+                        # Continue with next row or break based on your needs
+                        continue
+
+                # Commit the transaction
+                conn.commit()
+                print(f"Successfully appended {len(Data)} rows to {table_name}")
+            else:
+                print(f"Table {table_name} does not exist")
+        
+        except Exception as e:
+            print(f"Error checking table existence or extracting last date: {e}")
+        
+    conn.commit()
+    conn.close()
+        
+    print(f"✓ Successfully imported {len(Data)} rows to {table_name}")
+        
+    # Verify import (using pyodbc)
+    verify_import_pyodbc(connection_string, table_name, Data)
+
+def encode_time_cyclic_flexible_decimal(df, mode='reduced'):
+    """
+    Encode time into cyclic components using decimal hour.
+    
+    Parameters:
+        df : pandas DataFrame
+            Must have a 'Time' column with datetime64[ns] dtype.
+        mode : str
+            One of 'reduced', 'day', or 'full'.
+    
+    Returns:
+        encoded_df : pandas DataFrame
+            DataFrame with cyclically encoded time features.
+    """
+    # Extract datetime column
+    time = pd.to_datetime(df)
+
+    # Date range to process
+    daterange = copy.copy(df)
+
+    # Decimal hour (e.g. 1.25, 13.5, ...)
+    hour_decimal = time.hour + time.minute / 60.0
+    hour_angle = 2 * np.pi * hour_decimal / 24.0
+    Hour_sin = np.sin(hour_angle)
+    Hour_cos = np.cos(hour_angle)
+
+    day_of_year = time.dayofyear
+    day_angle = 2 * np.pi * day_of_year / 365.0
+    month_angle = 2 * np.pi * time.month / 12.0
+
+    # Hours to handle the clock change
+    Hours = [time[i].hour for i in range(len(time))]
+        
+    # Indices to be deleted and appended
+    indices_to_delete = []
+    indices_to_insert = []
+
+    # First 
+    for h in range(4,len(Hours)):
+        if Hours[h] == Hours[h-4]:
+            indices_to_delete.extend([h])
+    
+    day_angle = [day_angle[i] for i in range(len(day_angle)) if i not in indices_to_delete]
+    month_angle = [month_angle[i] for i in range(len(month_angle)) if i not in indices_to_delete]
+    Hours = [Hours[i] for i in range(len(Hours)) if i not in indices_to_delete]
+    daterange = [daterange[i] for i in range(len(daterange)) if i not in indices_to_delete]
+    Hour_sin = [Hour_sin[i] for i in range(len(Hour_sin)) if i not in indices_to_delete]
+    Hour_cos = [Hour_cos[i] for i in range(len(Hour_cos)) if i not in indices_to_delete]
+
+    for h in range(len(Hours)):
+        if Hours[h] == Hours[h-4] + 2:
+            indices_to_insert.extend([h])
+
+    day_angle = insert_interpolated_values(day_angle, indices_to_insert,'num')
+    month_angle = insert_interpolated_values(month_angle, indices_to_insert,'num')
+    Hour_sin = insert_interpolated_values(Hour_sin, indices_to_insert,'num')
+    Hour_cos = insert_interpolated_values(Hour_cos, indices_to_insert,'num')
+    daterange = insert_interpolated_values(daterange, indices_to_insert,'date')
+
+    # Initialize result DataFrame
+    encoded_df = pd.DataFrame()
+
+    # Always include hour cycling features (both decimal and hour-in-day)
+    encoded_df['Hour_sin'] = Hour_sin
+    encoded_df['Hour_cos'] = Hour_cos
+
+    # Add day-of-year cyclic features if needed
+    if mode in ['day', 'full']:
+        encoded_df['Day_sin'] = np.sin(day_angle)
+        encoded_df['Day_cos'] = np.cos(day_angle)
+
+    # Add month cyclic features if needed
+    if mode == 'full':
+        encoded_df['Month_sin'] = np.sin(month_angle)
+        encoded_df['Month_cos'] = np.cos(month_angle)
+
+    # Return the final dates too, after interpolation ----
+     
+    return encoded_df, daterange
+
+def insert_interpolated_values(List, indices_to_insert, mode):
+    """
+    Insert interpolated values at specified integer indices in List list.
+    """
+    result = []
+    
+    if mode == 'date':
+        for i, value in enumerate(List):
+            # If this is an index where we need to insert, add interpolated value first
+            if i in indices_to_insert:
+                # Check if we have neighbors for interpolation
+                if i > 0 and i < len(List):
+                    interpolated_val = List[i]
+                    result.append(interpolated_val)
+        
+            # Always add the original value
+            result.append(value)
+    else:
+        for i, value in enumerate(List):
+            # If this is an index where we need to insert, add interpolated value first
+            if i in indices_to_insert:
+                # Check if we have neighbors for interpolation
+                if i > 0 and i < len(List):
+                    prev_val = List[i - 1]
+                    next_val = List[i]
+                    # Linear interpolation (average of neighbors)
+                    interpolated_val = (prev_val + next_val) / 2
+                    result.append(interpolated_val)
+        
+            # Always add the original value
+            result.append(value)
+    
+    return result
+
+def process_price_data(Data, client, country, start, end):
+    '''
+    process solar forecast data - handle the data extracted from the entsoe
+    '''
+    # Query the wind and solar forecast
+    Price_Data = client.query_day_ahead_prices(country, start=start, end=end)
+    
+    # Largest lag - in this case, seven days
+    largestlag = 24*7*4
+
+    def interpolation_missing_dates(Price_Data):
+        # Determine the resolution of the input data
+        if len(Price_Data) > 1:
+            time_diff = Price_Data.index[1] - Price_Data.index[0]
+            is_15min_resolution = time_diff <= pd.Timedelta(minutes=30)  # 15min or smaller
+        else:
+            is_15min_resolution = False  # Default assumption
+
+        # Create complete daterange that accounts for possible clock changes
+        Daterange = pd.date_range(start , end, freq="15min", inclusive='left')
+
+        # Create series with the complete 15min daterange
+        PriceRaw = pd.Series([np.nan] * len(Daterange), index=Daterange)
+
+        if not is_15min_resolution:
+            # HOURLY DATA: Interpolate and expand to 15min
+            print("Processing HOURLY data - interpolating to 15min resolution")
+        
+            # Filter to full hours only
+            DatesPrice = Price_Data.index
+            minuteindices = [j for j in range(len(DatesPrice)) if pd.Timestamp(DatesPrice[j]).minute == 0]
+            DatesPrice = DatesPrice[minuteindices]
+            Price = np.array(Price_Data[minuteindices])
+        
+            # Create hourly series for interpolation
+            hourly_daterange = pd.date_range(
+                start, 
+                end, 
+                freq="H", 
+                inclusive='left'
+            )
+            hourly_series = pd.Series([np.nan] * len(hourly_daterange), index=hourly_daterange)
+        
+            # Fill available hourly data
+            for i, date in enumerate(DatesPrice):
+                if date in hourly_series.index:
+                    hourly_series[date] = Price[i]
+        
+            # Interpolate missing hourly values
+            hourly_series = hourly_series.interpolate(method='linear')
+        
+            # Expand hourly to 15min using linear interpolation between hours
+            for i in range(len(hourly_series) - 1):
+                current_hour = hourly_series.index[i]
+                next_hour = hourly_series.index[i + 1]
+                current_val = hourly_series.iloc[i]
+                next_val = hourly_series.iloc[i + 1]
+            
+                if not pd.isna(current_val) and not pd.isna(next_val):
+                    # Create 4 linear interpolated values for this hour
+                    for j in range(4):
+                        interp_time = current_hour + pd.Timedelta(minutes=15 * j)
+                        # Linear interpolation between current and next hour
+                        fraction = j / 4.0
+                        interp_value = current_val + (next_val - current_val) * fraction
+                    
+                        if interp_time in PriceRaw.index:
+                            PriceRaw[interp_time] = interp_value
+        
+            # Handle the last hour
+            if len(hourly_series) > 0:
+                last_hour = hourly_series.index[-1]
+                last_val = hourly_series.iloc[-1]
+                if not pd.isna(last_val):
+                    for j in range(4):
+                        interp_time = last_hour + pd.Timedelta(minutes=15 * j)
+                        if interp_time in PriceRaw.index:
+                            PriceRaw[interp_time] = last_val
+                        
+        else:
+            # 15MIN DATA: Direct interpolation
+            print("Processing 15MIN data - direct interpolation")
+        
+            DatesPrice = Price_Data.index
+            Price = np.array(Price_Data)
+        
+            # Fill available 15min data directly
+            for i, date in enumerate(DatesPrice):
+                if date in PriceRaw.index:
+                    PriceRaw[date] = Price[i]
+        
+            # Linear interpolation for missing 15min values
+            PriceRaw = PriceRaw.interpolate(method='linear')
+
+        # Handle clock changes (daylight saving time transitions)
+        Hours = [Daterange[i].hour for i in range(len(Daterange))]
+    
+        # Detect clock changes
+        indices_to_delete = []
+        indices_to_insert = []
+
+        for h in range(4, len(Hours)):
+            if Hours[h] == Hours[h-4]:
+                # Duplicate hour (fall back) - delete the duplicate
+                indices_to_delete.append(h)
+            elif Hours[h] == Hours[h-4] + 2:
+                # Skipped hour (spring forward) - insert interpolated values
+                indices_to_insert.append(h)
+
+        # Apply clock change adjustments
+        if indices_to_delete:
+            PriceRaw_values = [PriceRaw.iloc[i] for i in range(len(PriceRaw)) if i not in indices_to_delete]
+            PriceRaw_dates = [PriceRaw.index[i] for i in range(len(PriceRaw)) if i not in indices_to_delete]
+        else:
+            PriceRaw_values = PriceRaw.tolist()
+            PriceRaw_dates = [PriceRaw.index[i] for i in range(len(PriceRaw)) if i not in indices_to_delete]
+
+        if indices_to_insert:
+            PriceRaw_values = insert_interpolated_values(PriceRaw_values, indices_to_insert, 'regular')
+            PriceRaw_dates = insert_interpolated_values(PriceRaw_dates, indices_to_insert, 'date')
+
+        return PriceRaw_values, PriceRaw_dates
+
+    # Import the data to dataframe with lags
+    interpolated_price_data, interpolated_price_date = interpolation_missing_dates(Price_Data)
+    Data['Prices'] = interpolated_price_data[largestlag:]
+    Data['Prices_One_Day'] = interpolated_price_data[largestlag-24*4:-24*4]
+    Data['Prices_Two_Days'] = interpolated_price_data[largestlag-48*4:-48*4]
+    Data['Prices_Seven_Days'] = interpolated_price_data[largestlag-24*7*4:-24*7*4]
+
+    return Data
+
+def ask_database_choice(database_type):
+    """
+    Popup dialog that should be visible
+    """
+    root = tk.Tk()
+    root.withdraw()
+    
+    choice = None
+    
+    def submit_choice():
+        nonlocal choice
+        user_input = entry.get().strip().upper()
+        if user_input in ['R', 'U']:
+            choice = user_input
+            dialog.destroy()
+        else:
+            messagebox.showerror("Invalid Input", "Please enter only 'R' or 'U'")
+            entry.delete(0, tk.END)
+            entry.focus()
+    
+    # Create dialog window
+    dialog = tk.Toplevel(root)
+    dialog.title("Database Setup - R/U Choice")
+    dialog.geometry('500x250')
+    dialog.resizable(False, False)
+    
+    # Force the window to be on top and visible
+    dialog.attributes('-topmost', True)
+    dialog.lift()
+    dialog.focus_force()
+    
+    # Define fonts
+    font_arial_16 = ('Arial', 16)
+    font_arial_14 = ('Arial', 14)
+    
+    # Add widgets
+    tk.Label(dialog, 
+             text="Would you like your " + str(database_type) + " database to be:\nR - Restarted\nU - Updated",
+             pady=20,
+             font=font_arial_16,
+             justify='center').pack()
+    
+    tk.Label(dialog,
+             text="Enter R or U:",
+             pady=10,
+             font=font_arial_14).pack()
+    
+    # Input field
+    entry = tk.Entry(dialog, 
+                    font=font_arial_16,
+                    width=10,
+                    justify='center')
+    entry.pack(pady=10)
+    
+    # Submit button
+    tk.Button(dialog,
+              text="Submit",
+              command=submit_choice,
+              width=12,
+              height=1,
+              bg='lightblue',
+              font=font_arial_14).pack(pady=10)
+    
+    # Bind Enter key
+    dialog.bind('<Return>', lambda e: submit_choice())
+    
+    # Focus and select all text in entry
+    entry.focus_set()
+    entry.select_range(0, tk.END)
+    
+    # Center and make sure it's visible
+    dialog.update()
+    dialog.deiconify()
+    
+    # Wait for the dialog
+    dialog.wait_window()
+    root.destroy()
+    
+    return choice
+
+# Example usage
+if __name__ == "__main__":
+    print("=== Excel to SQL Server Importer ===\n")
+    
+    # List available drivers
+    Server_Routines.list_available_drivers()
+    print()
+    
+    # Test server connections
+    print("Testing server connections...")
+    working_servers = Server_Routines.test_server_connections()
+    
+    if not working_servers:
+        print("No working server connections found. Please check:")
+        print("1. Is SQL Server installed and running?")
+        print("2. Are you using the correct server name?")
+        print("3. Try using 'localhost\\SQLEXPRESS' for SQL Express")
+        exit()
+    
+    # Use the first working server
+    server, driver = working_servers[0]
+    print(f"Using server: {server}, driver: {driver}")
+        
+    # Country codes
+    country_codes = ['FR','AT','FR','BE','NL','DE_LU','RO','BG','HR','GR','CZ','SK']
+
+    # Initiate a new Nominatim client for geopy
+    app = Nominatim(user_agent="tutorial")
+
+    # Define the path where you will store everything
+    path  = r'C:\Users\Stevan\source\repos\PriceDatabaseCreation\PriceDatabaseCreation'
+    set_path(path)
+
+    # Data to import
+    Data_import = pd.DataFrame()
+
+    # Starting timestamp
+    start_time_initial_database = input("What would be the starting time of the initial database? ")
+
+    # Ending timestamp
+    end_time_initial_database = (pd.Timestamp.now(tz='Europe/Brussels').floor("D") - pd.Timedelta(1,"d")).strftime("%Y%m%d")
+
+    # Define starting and ending time
+    start = pd.Timestamp(start_time_initial_database, tz='Europe/Brussels')
+    end = pd.Timestamp(end_time_initial_database, tz='Europe/Brussels')
+
+    # Extract primary energy prices
+    Primary_Energy = ExtractGasandCoal.get_all_energy_prices(start_time_initial_database)
+
+    # Client connection
+    client = EntsoePandasClient(api_key="186656f9-a760-4910-8e8e-4f7051e19a5f")
+    #Data = client.query_installed_generation_capacity_per_unit ('DE_LU', start=start, end=end)
+
+    # Daterange - from start until the end + 2 days
+    daterange = pd.date_range(start=start, end=end + pd.Timedelta(2,"d"), freq='15min')
+
+    # Periodical features
+    encoded, daterange = encode_time_cyclic_flexible_decimal(daterange, mode='full')
+
+    # Store dates
+    Data_import['Dates'] = daterange[:-1]
+
+    # Remove the last sample
+    encoded = encoded.iloc[:-1]
+    Data_import['Hour_sin'] = encoded['Hour_sin'].values
+    Data_import['Hour_cos'] = encoded['Hour_cos'].values
+    Data_import['Day_sin'] = encoded['Day_sin'].values
+    Data_import['Day_cos'] = encoded['Day_cos'].values
+    Data_import['Month_sin'] = encoded['Month_sin'].values
+    Data_import['Month_cos'] = encoded['Month_cos'].values
+
+    # Client connection
+    client = EntsoePandasClient(api_key="186656f9-a760-4910-8e8e-4f7051e19a5f")
+
+    # Import the data for Serbia (the country we try to forecast the value for)
+    Data_import = process_price_data(Data_import, client, 'RS', start - pd.Timedelta(7,"d") + pd.Timedelta(1,"h"), end + pd.Timedelta(2,"d"))
+
+    # Create the price database and populate it with the forecasted consumption and renewables for each of the country
+    for i in range(len(country_codes)):
+        # Import the consumption data and store it to new table
+        Consumption_Data = sqlserver_to_dataframe(server, 'Energy_Database', driver, country_codes[i] + 'Consumption_Features')
+        Data_import[country_codes[i] + '_consumption_forecasted'] = Consumption_Data['forecasted']
+
+        # Import the renwables data
+        Renewables_Data = sqlserver_to_dataframe(server, 'RES', driver, country_codes[i] + 'RES_features')
+
+        # Store the solar data
+        Data_import[country_codes[i] + '_solar_forecasted'] = Renewables_Data['solar_forecasted']
+
+        # Store the wind_onshore data
+        Data_import[country_codes[i] + '_wind_onshore_forecasted'] = Renewables_Data['_wind_onshore_forecasted']
+
+        # Store the wind_offshore data
+        Data_import[country_codes[i] + '_wind_offshore_forecasted'] = Renewables_Data['_wind_offshore_forecasted']
+    
+    # Consumption and renewables data imported to the table - remaining is the primary energy prices
+    import_to_table('replace', 'RS_price_features', 'Price', Data_import)
+
+    # Run the periodic import after the database is ready
+    for i in range(len(country_codes)):
+
+        # Run the periodic import later
+        ConsumptionPeriodicImport.main()
+        RenewablesDataBasePeriodicImport.main()
